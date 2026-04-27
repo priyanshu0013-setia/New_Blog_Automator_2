@@ -204,9 +204,18 @@ function assertParaphrasePreflight(text: string): void {
 function detectParaphraserIntrusion(text: string): string | null {
   const normalized = text.trim();
   if (!normalized) return "empty_output";
+  if (isParaphraserMetaText(normalized)) {
+    const matched = PARAPHRASER_INTRUSION_PATTERNS.find((pattern) => pattern.test(normalized));
+    return matched ? matched.source : "meta_text";
+  }
+  return null;
+}
+
+export function isParaphraserMetaText(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
   const matched = PARAPHRASER_INTRUSION_PATTERNS.find((pattern) => pattern.test(normalized));
-  if (!matched) return null;
-  return matched.source;
+  return Boolean(matched);
 }
 
 async function fetchWithTimeout(
@@ -395,7 +404,15 @@ export async function humanizeText(
       lastErr = err;
       const retryable = isRetryableError(err);
       const isLastAttempt = attempt === PARAPHRASE_MAX_ATTEMPTS;
-      if (isLastAttempt || !retryable) break;
+      if (isLastAttempt || !retryable) {
+        if (!retryable && !isLastAttempt) {
+          logger.warn(
+            { err, attempt, tone: safeTone, genSpeed: safeGenSpeed, timeoutMs: paraphraseTimeoutMs },
+            "ZeroGPT paraphrase encountered non-retryable error; stopping retries",
+          );
+        }
+        break;
+      }
       const delay = PARAPHRASE_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
         { err, attempt, delay, tone: safeTone, genSpeed: safeGenSpeed, timeoutMs: paraphraseTimeoutMs, retryable },
@@ -490,7 +507,12 @@ export async function scoreAiContent(text: string): Promise<number> {
       lastErr = err;
       const retryable = isRetryableError(err);
       const isLastAttempt = attempt === DETECT_MAX_ATTEMPTS;
-      if (isLastAttempt || !retryable) break;
+      if (isLastAttempt || !retryable) {
+        if (!retryable && !isLastAttempt) {
+          logger.warn({ err, attempt }, "ZeroGPT detect encountered non-retryable error; stopping retries");
+        }
+        break;
+      }
       const delay = DETECT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
         { err, attempt, delay, retryable },

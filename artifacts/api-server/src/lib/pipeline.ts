@@ -10,6 +10,7 @@ import {
   isZeroGptConfigured,
   ZeroGptError,
   getTextStats,
+  isParaphraserMetaText,
 } from "./zerogpt";
 import {
   gatherVerifiedSources,
@@ -41,6 +42,8 @@ const DENSITY_REBALANCE_MAX_WORD_DRIFT = 0.08;
 const DENSITY_REBALANCE_MIN_IMPROVEMENT = 0.25;
 const DRAFT_DENSITY_RETRY_MAX_DISTANCE = 0.2;
 const WORD_COUNT_WARNING_TOLERANCE = 200;
+// Keep chunk sizes comfortably below ZeroGPT preflight hard limits
+// (3500 words / 30000 chars) so normal long-form sections fit safely.
 const HUMANIZE_CHUNK_TARGET_WORDS = 900;
 const HUMANIZE_CHUNK_MAX_CHARS = 9000;
 
@@ -407,13 +410,7 @@ function splitArticleForHumanization(article: string): string[] {
 function stripChatbotIntrusions(text: string): { text: string; removedCount: number } {
   const lines = text.split("\n");
   const filtered = lines.filter((line) => {
-    const lower = line.trim().toLowerCase();
-    return !(
-      lower.includes("please provide the text you would like me to paraphrase") ||
-      lower.includes("please provide the text to paraphrase") ||
-      lower.includes("certainly! please provide") ||
-      lower.includes("here is the rewritten version")
-    );
+    return !isParaphraserMetaText(line);
   });
   return { text: filtered.join("\n"), removedCount: lines.length - filtered.length };
 }
@@ -662,7 +659,7 @@ A one-paragraph hook or angle that differentiates this article from competitors.
       const densitySection = densityHint
         ? `\n\nPREVIOUS ATTEMPT: primary keyword density was ${densityHint.lastDensity}% (target ${PRIMARY_DENSITY_TARGET_MIN}%–${PRIMARY_DENSITY_TARGET_MAX}%). ${
           densityHint.tooLow
-              ? `That's TOO LOW. Increase use of the primary keyword "${article.primaryKeyword}" with light, natural placements in key sentences and headings. Avoid repetitive stuffing patterns.`
+              ? `That's TOO LOW. Slightly increase natural mentions of "${article.primaryKeyword}" where they genuinely fit the context. Keep prose varied and avoid repetitive phrasing.`
               : `That's TOO HIGH. Reduce repeated close-together uses of "${article.primaryKeyword}" by using natural references and varied sentence construction.`
         }\n`
         : "";
