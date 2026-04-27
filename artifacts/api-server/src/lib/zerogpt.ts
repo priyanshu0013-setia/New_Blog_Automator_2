@@ -47,6 +47,8 @@ const PARAPHRASE_BASE_DELAY_MS = 2000;
 const PARAPHRASE_BASE_TIMEOUT_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_MS", 90_000);
 const PARAPHRASE_TIMEOUT_PER_WORD_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_PER_WORD_MS", 40);
 const PARAPHRASE_TIMEOUT_CAP_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_CAP_MS", 300_000);
+const PARAPHRASE_MAX_WORDS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_MAX_WORDS", 3500);
+const PARAPHRASE_MAX_CHARS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_MAX_CHARS", 30000);
 const DETECT_MAX_ATTEMPTS = 2;
 const DETECT_BASE_DELAY_MS = 1000;
 const DETECT_TIMEOUT_MS = 25_000;
@@ -68,9 +70,34 @@ const VALID_ZEROGPT_TONES = new Set([
   "Teenager",
 ]);
 const VALID_GEN_SPEEDS = new Set(["quick", "thinking"]);
+const PARAPHRASER_INTRUSION_PATTERNS = [
+  /please provide the text you would like me to paraphrase/i,
+  /please provide (the )?text to paraphrase/i,
+  /certainly!? please provide/i,
+  /here(?:'s| is) the rewritten version/i,
+  /as an ai language model/i,
+];
+
+type ZeroGptErrorCategory =
+  | "preflight"
+  | "timeout"
+  | "network"
+  | "client_4xx"
+  | "server_5xx"
+  | "response_invalid"
+  | "unknown";
 
 export class ZeroGptError extends Error {
-  constructor(message: string, public readonly cause?: unknown) {
+  constructor(
+    message: string,
+    public readonly cause?: unknown,
+    public readonly meta?: {
+      category?: ZeroGptErrorCategory;
+      retryable?: boolean;
+      statusCode?: number;
+      operation?: "paraphrase" | "detect";
+    },
+  ) {
     super(message);
     this.name = "ZeroGptError";
   }
@@ -79,6 +106,11 @@ export class ZeroGptError extends Error {
 export function isZeroGptConfigured(): boolean {
   return Boolean(ZEROGPT_API_KEY);
 }
+
+type TextStats = {
+  words: number;
+  chars: number;
+};
 
 function parsePositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -102,9 +134,8 @@ function normalizeGenSpeed(): "quick" | "thinking" {
 }
 
 function getParaphraseTimeoutMs(text: string): number {
-  const trimmed = text.trim();
-  const wordCount = trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length;
-  const adaptive = PARAPHRASE_BASE_TIMEOUT_MS + wordCount * PARAPHRASE_TIMEOUT_PER_WORD_MS;
+  const { words } = getTextStats(text);
+  const adaptive = PARAPHRASE_BASE_TIMEOUT_MS + words * PARAPHRASE_TIMEOUT_PER_WORD_MS;
   return Math.min(adaptive, PARAPHRASE_TIMEOUT_CAP_MS);
 }
 
@@ -113,10 +144,76 @@ function toErrorMessage(err: unknown): string {
   return String(err);
 }
 
+export function getTextStats(text: string): TextStats {
+  const trimmed = text.trim();
+  const words = trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length;
+  return { words, chars: text.length };
+}
+
+function createZeroGptError(
+  message: string,
+  opts: {
+    cause?: unknown;
+    category: ZeroGptErrorCategory;
+    retryable: boolean;
+    statusCode?: number;
+    operation: "paraphrase" | "detect";
+  },
+): ZeroGptError {
+  return new ZeroGptError(message, opts.cause, {
+    category: opts.category,
+    retryable: opts.retryable,
+    statusCode: opts.statusCode,
+    operation: opts.operation,
+  });
+}
+
+function isRetryableError(err: unknown): boolean {
+  if (err instanceof ZeroGptError) return err.meta?.retryable ?? false;
+  return false;
+}
+
+function classifyHttpStatus(status: number): { category: ZeroGptErrorCategory; retryable: boolean } {
+  if (status >= 500) return { category: "server_5xx", retryable: true };
+  if (status === 429 || status === 408) return { category: "client_4xx", retryable: true };
+  if (status >= 400) return { category: "client_4xx", retryable: false };
+  return { category: "unknown", retryable: false };
+}
+
+function assertParaphrasePreflight(text: string): void {
+  const { words, chars } = getTextStats(text);
+  if (words === 0) {
+    throw createZeroGptError("ZeroGPT paraphrase preflight failed: empty input", {
+      category: "preflight",
+      retryable: false,
+      operation: "paraphrase",
+    });
+  }
+  if (words > PARAPHRASE_MAX_WORDS || chars > PARAPHRASE_MAX_CHARS) {
+    throw createZeroGptError(
+      `ZeroGPT paraphrase preflight failed: input too large (${words} words, ${chars} chars; limits ${PARAPHRASE_MAX_WORDS} words / ${PARAPHRASE_MAX_CHARS} chars)`,
+      {
+        category: "preflight",
+        retryable: false,
+        operation: "paraphrase",
+      },
+    );
+  }
+}
+
+function detectParaphraserIntrusion(text: string): string | null {
+  const normalized = text.trim();
+  if (!normalized) return "empty_output";
+  const matched = PARAPHRASER_INTRUSION_PATTERNS.find((pattern) => pattern.test(normalized));
+  if (!matched) return null;
+  return matched.source;
+}
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
+  operation: "paraphrase" | "detect",
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -124,9 +221,19 @@ async function fetchWithTimeout(
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
-      throw new ZeroGptError(`ZeroGPT request timed out after ${timeoutMs}ms`, err);
+      throw createZeroGptError(`ZeroGPT request timed out after ${timeoutMs}ms`, {
+        cause: err,
+        category: "timeout",
+        retryable: true,
+        operation,
+      });
     }
-    throw err;
+    throw createZeroGptError(`ZeroGPT request failed: ${toErrorMessage(err)}`, {
+      cause: err,
+      category: "network",
+      retryable: true,
+      operation,
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -184,8 +291,13 @@ export async function humanizeText(
   userTone?: string | null,
 ): Promise<string> {
   if (!ZEROGPT_API_KEY) {
-    throw new ZeroGptError("ZEROGPT_API_KEY is not configured");
+    throw createZeroGptError("ZEROGPT_API_KEY is not configured", {
+      category: "preflight",
+      retryable: false,
+      operation: "paraphrase",
+    });
   }
+  assertParaphrasePreflight(text);
 
   const tone = mapToneToZeroGpt(userTone);
   if (!VALID_ZEROGPT_TONES.has(tone)) {
@@ -219,12 +331,20 @@ export async function humanizeText(
           }),
         },
         paraphraseTimeoutMs,
+        "paraphrase",
       );
 
       if (!response.ok) {
         const body = await response.text().catch(() => "<unreadable>");
-        throw new ZeroGptError(
+        const statusInfo = classifyHttpStatus(response.status);
+        throw createZeroGptError(
           `ZeroGPT paraphrase returned ${response.status}: ${body.slice(0, 300)}`,
+          {
+            category: statusInfo.category,
+            retryable: statusInfo.retryable,
+            statusCode: response.status,
+            operation: "paraphrase",
+          },
         );
       }
 
@@ -234,26 +354,51 @@ export async function humanizeText(
       // The paraphrased text lives at data.message. We also defend against the
       // top-level success flag being false even on 200 responses.
       if (!isObjectLike(json)) {
-        throw new ZeroGptError("ZeroGPT paraphrase response was not a JSON object");
+        throw createZeroGptError("ZeroGPT paraphrase response was not a JSON object", {
+          category: "response_invalid",
+          retryable: false,
+          operation: "paraphrase",
+        });
       }
       if (json.success === false) {
-        throw new ZeroGptError(
+        throw createZeroGptError(
           `ZeroGPT paraphrase reported failure: ${typeof json.message === "string" ? json.message : "unknown"}`,
+          {
+            category: "response_invalid",
+            retryable: false,
+            operation: "paraphrase",
+          },
         );
       }
 
       const paraphrased = extractParaphrased(json);
       if (!paraphrased || paraphrased.trim().length === 0) {
-        throw new ZeroGptError("ZeroGPT paraphrase returned empty text");
+        throw createZeroGptError("ZeroGPT paraphrase returned empty text", {
+          category: "response_invalid",
+          retryable: false,
+          operation: "paraphrase",
+        });
+      }
+      const intrusion = detectParaphraserIntrusion(paraphrased);
+      if (intrusion) {
+        throw createZeroGptError(
+          `ZeroGPT paraphrase output contained meta-chat intrusion (${intrusion})`,
+          {
+            category: "response_invalid",
+            retryable: false,
+            operation: "paraphrase",
+          },
+        );
       }
       return paraphrased;
     } catch (err) {
       lastErr = err;
+      const retryable = isRetryableError(err);
       const isLastAttempt = attempt === PARAPHRASE_MAX_ATTEMPTS;
-      if (isLastAttempt) break;
+      if (isLastAttempt || !retryable) break;
       const delay = PARAPHRASE_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
-        { err, attempt, delay, tone: safeTone, genSpeed: safeGenSpeed, timeoutMs: paraphraseTimeoutMs },
+        { err, attempt, delay, tone: safeTone, genSpeed: safeGenSpeed, timeoutMs: paraphraseTimeoutMs, retryable },
         `ZeroGPT paraphrase attempt ${attempt} failed; retrying in ${delay}ms`,
       );
       await new Promise((r) => setTimeout(r, delay));
@@ -273,7 +418,11 @@ export async function humanizeText(
  */
 export async function scoreAiContent(text: string): Promise<number> {
   if (!ZEROGPT_API_KEY) {
-    throw new ZeroGptError("ZEROGPT_API_KEY is not configured");
+    throw createZeroGptError("ZEROGPT_API_KEY is not configured", {
+      category: "preflight",
+      retryable: false,
+      operation: "detect",
+    });
   }
 
   const url = `${ZEROGPT_API_BASE_URL}${ZEROGPT_DETECT_PATH}`;
@@ -292,37 +441,59 @@ export async function scoreAiContent(text: string): Promise<number> {
           body: JSON.stringify({ input_text: text }),
         },
         DETECT_TIMEOUT_MS,
+        "detect",
       );
 
       if (!response.ok) {
         const body = await response.text().catch(() => "<unreadable>");
-        throw new ZeroGptError(
+        const statusInfo = classifyHttpStatus(response.status);
+        throw createZeroGptError(
           `ZeroGPT detect returned ${response.status}: ${body.slice(0, 300)}`,
+          {
+            category: statusInfo.category,
+            retryable: statusInfo.retryable,
+            statusCode: response.status,
+            operation: "detect",
+          },
         );
       }
 
       const json = (await response.json()) as unknown;
       if (!isObjectLike(json)) {
-        throw new ZeroGptError("ZeroGPT detect response was not a JSON object");
+        throw createZeroGptError("ZeroGPT detect response was not a JSON object", {
+          category: "response_invalid",
+          retryable: false,
+          operation: "detect",
+        });
       }
       if (json.success === false) {
-        throw new ZeroGptError(
+        throw createZeroGptError(
           `ZeroGPT detect reported failure: ${typeof json.message === "string" ? json.message : "unknown"}`,
+          {
+            category: "response_invalid",
+            retryable: false,
+            operation: "detect",
+          },
         );
       }
 
       const score = extractAiScore(json);
       if (score === null) {
-        throw new ZeroGptError("ZeroGPT detect response missing AI score");
+        throw createZeroGptError("ZeroGPT detect response missing AI score", {
+          category: "response_invalid",
+          retryable: false,
+          operation: "detect",
+        });
       }
       return score;
     } catch (err) {
       lastErr = err;
+      const retryable = isRetryableError(err);
       const isLastAttempt = attempt === DETECT_MAX_ATTEMPTS;
-      if (isLastAttempt) break;
+      if (isLastAttempt || !retryable) break;
       const delay = DETECT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
-        { err, attempt, delay },
+        { err, attempt, delay, retryable },
         `ZeroGPT detect attempt ${attempt} failed; retrying in ${delay}ms`,
       );
       await new Promise((r) => setTimeout(r, delay));
