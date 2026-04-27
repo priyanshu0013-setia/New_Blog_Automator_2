@@ -70,13 +70,8 @@ const VALID_ZEROGPT_TONES = new Set([
   "Teenager",
 ]);
 const VALID_GEN_SPEEDS = new Set(["quick", "thinking"]);
-const PARAPHRASER_INTRUSION_PATTERNS = [
-  /please provide the text you would like me to paraphrase/i,
-  /please provide (the )?text to paraphrase/i,
-  /certainly!? please provide/i,
-  /here(?:'s| is) the rewritten version/i,
-  /as an ai language model/i,
-];
+const PARAPHRASER_INTRUSION_REGEX =
+  /please provide the text you would like me to paraphrase|please provide (the )?text to paraphrase|certainly!? please provide|here(?:'s| is) the rewritten version|as an ai language model/i;
 
 type ZeroGptErrorCategory =
   | "preflight"
@@ -204,18 +199,14 @@ function assertParaphrasePreflight(text: string): void {
 function detectParaphraserIntrusion(text: string): string | null {
   const normalized = text.trim();
   if (!normalized) return "empty_output";
-  if (isParaphraserMetaText(normalized)) {
-    const matched = PARAPHRASER_INTRUSION_PATTERNS.find((pattern) => pattern.test(normalized));
-    return matched ? matched.source : "meta_text";
-  }
+  if (isParaphraserMetaText(normalized)) return "meta_text";
   return null;
 }
 
 export function isParaphraserMetaText(text: string): boolean {
   const normalized = text.trim();
   if (!normalized) return false;
-  const matched = PARAPHRASER_INTRUSION_PATTERNS.find((pattern) => pattern.test(normalized));
-  return Boolean(matched);
+  return PARAPHRASER_INTRUSION_REGEX.test(normalized);
 }
 
 async function fetchWithTimeout(

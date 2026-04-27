@@ -918,7 +918,7 @@ ${articleAfterCitationCheck}`;
       await logStep(articleId, "format_restore", "running", "Running deterministic post-humanization format repair");
       try {
         const deterministic = deterministicFormatRepair(finalArticle);
-        if (deterministic.changed) finalArticle = deterministic.text;
+        finalArticle = deterministic.text;
         const postDeterministic = assessFormatStructure(articleAfterHeadingFix, finalArticle);
         if (!postDeterministic.needsModelRestore) {
           await logStep(
