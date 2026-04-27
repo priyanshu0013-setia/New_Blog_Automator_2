@@ -9,6 +9,8 @@ import {
   scoreAiContent,
   isZeroGptConfigured,
   ZeroGptError,
+  getTextStats,
+  stripIntrusionLines,
 } from "./zerogpt";
 import {
   gatherVerifiedSources,
@@ -39,6 +41,11 @@ const ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE =
 const DENSITY_REBALANCE_MAX_WORD_DRIFT = 0.08;
 const DENSITY_REBALANCE_MIN_IMPROVEMENT = 0.25;
 const DRAFT_DENSITY_RETRY_MAX_DISTANCE = 0.2;
+const WORD_COUNT_WARNING_TOLERANCE = 200;
+// Keep chunk sizes comfortably below ZeroGPT preflight hard limits
+// (3500 words / 30000 chars) so normal long-form sections fit safely.
+const HUMANIZE_CHUNK_TARGET_WORDS = 900;
+const HUMANIZE_CHUNK_MAX_CHARS = 9000;
 
 // ─── DB helpers ──────────────────────────────────────────────────────────────
 
@@ -338,6 +345,126 @@ function generateSeoSlug(title: string, keyword: string): string {
     .slice(0, 80);
 }
 
+function splitByH2Sections(article: string): string[] {
+  const lines = article.split("\n");
+  const sections: string[] = [];
+  let current: string[] = [];
+  for (const line of lines) {
+    const isH2 = /^##\s+/.test(line.trim());
+    if (isH2 && current.length > 0) {
+      sections.push(current.join("\n").trim());
+      current = [line];
+      continue;
+    }
+    current.push(line);
+  }
+  if (current.length > 0) sections.push(current.join("\n").trim());
+  return sections.filter((s) => s.length > 0);
+}
+
+function splitLargeSection(section: string): string[] {
+  const blocks = section
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentWords = 0;
+  let currentChars = 0;
+  for (const block of blocks) {
+    const words = countWords(block);
+    const chars = block.length;
+    const wouldOverflow =
+      current.length > 0 &&
+      (currentWords + words > HUMANIZE_CHUNK_TARGET_WORDS ||
+        currentChars + chars > HUMANIZE_CHUNK_MAX_CHARS);
+    if (wouldOverflow) {
+      chunks.push(current.join("\n\n"));
+      current = [block];
+      currentWords = words;
+      currentChars = chars;
+      continue;
+    }
+    current.push(block);
+    currentWords += words;
+    currentChars += chars;
+  }
+  if (current.length > 0) chunks.push(current.join("\n\n"));
+  return chunks.filter((c) => c.trim().length > 0);
+}
+
+function splitArticleForHumanization(article: string): string[] {
+  const sections = splitByH2Sections(article);
+  const chunks: string[] = [];
+  for (const section of sections) {
+    const stats = getTextStats(section);
+    if (stats.words <= HUMANIZE_CHUNK_TARGET_WORDS && stats.chars <= HUMANIZE_CHUNK_MAX_CHARS) {
+      chunks.push(section);
+      continue;
+    }
+    chunks.push(...splitLargeSection(section));
+  }
+  return chunks.length > 0 ? chunks : [article];
+}
+
+function stripChatbotIntrusions(text: string): { text: string; removedCount: number } {
+  return stripIntrusionLines(text);
+}
+
+function deterministicFormatRepair(text: string): { text: string; changed: boolean; removedIntrusions: number } {
+  const intrusionStripped = stripChatbotIntrusions(text);
+  let repaired = intrusionStripped.text;
+  // Put headings on their own line when inline-collapsed.
+  repaired = repaired.replace(/([^\n])\s+(#{1,3}\s+\S+)/g, "$1\n\n$2");
+  // Ensure FAQ numbering starts on fresh lines.
+  repaired = repaired.replace(/([^\n])\s+(\*\*Q\d+[.:])/g, "$1\n\n$2");
+  // Normalize extra spaces + excessive blank lines.
+  repaired = repaired.replace(/[ \t]+\n/g, "\n").replace(/\n{4,}/g, "\n\n\n");
+  return {
+    text: repaired,
+    changed: repaired !== text,
+    removedIntrusions: intrusionStripped.removedCount,
+  };
+}
+
+function assessFormatStructure(reference: string, candidate: string): {
+  sourceHeadingCount: number;
+  candidateHeadingCount: number;
+  sourceFaqCount: number;
+  candidateFaqCount: number;
+  headingCoverageOk: boolean;
+  faqCoverageOk: boolean;
+  wordDrift: number;
+  needsModelRestore: boolean;
+} {
+  const sourceHeadingCount = (reference.match(/^#{1,3}\s+\S+/gm) ?? []).length;
+  const candidateHeadingCount = (candidate.match(/^#{1,3}\s+\S+/gm) ?? []).length;
+  const sourceFaqCount = extractFAQs(reference).length;
+  const candidateFaqCount = extractFAQs(candidate).length;
+  const headingCoverageOk =
+    sourceHeadingCount === 0 ||
+    candidateHeadingCount >= Math.max(
+      FORMAT_RESTORE_MIN_HEADING_COUNT,
+      Math.floor(sourceHeadingCount * FORMAT_RESTORE_MIN_HEADING_COVERAGE_RATIO),
+    );
+  const faqCoverageOk = sourceFaqCount === 0 || candidateFaqCount > 0;
+  const wordDrift =
+    Math.abs(countWords(candidate) - countWords(reference)) /
+    Math.max(countWords(reference), 1);
+  const needsModelRestore =
+    !headingCoverageOk || !faqCoverageOk || wordDrift > FORMAT_RESTORE_MAX_WORD_DRIFT;
+  return {
+    sourceHeadingCount,
+    candidateHeadingCount,
+    sourceFaqCount,
+    candidateFaqCount,
+    headingCoverageOk,
+    faqCoverageOk,
+    wordDrift,
+    needsModelRestore,
+  };
+}
+
 // ─── Claude API helper ───────────────────────────────────────────────────────
 
 type ClaudeGenerationOverrides = {
@@ -374,6 +501,43 @@ async function callClaude(
   const generated = textContent ? textContent.text : "";
   const includePrefill = overrides.includePrefillInReturn ?? true;
   return prefill && includePrefill ? prefill + generated : generated;
+}
+
+async function humanizeWithClaudeFallback(
+  client: Anthropic,
+  article: string,
+  tone?: string | null,
+): Promise<string> {
+  const prompt = `Rewrite this article to sound naturally human while preserving factual meaning and markdown structure.
+
+RULES:
+- Keep H1/H2/H3 structure, lists, tables, and FAQ numbering.
+- Keep all factual claims and numbers intact.
+- Avoid robotic repetition and template-like phrasing.
+- Do not add preamble or commentary.
+- Return markdown only.
+${tone ? `- Tone preference: ${tone}` : ""}
+
+ARTICLE:
+${article}`;
+  return callClaude(client, prompt, 8192, {
+    temperature: 0.55,
+    system:
+      "You are an expert editor. You humanize writing while preserving structure, facts, and SEO intent.",
+  });
+}
+
+async function humanizeWithZeroGptChunks(
+  article: string,
+  tone: string | null,
+): Promise<{ text: string; chunks: number }> {
+  const chunks = splitArticleForHumanization(article);
+  const rendered: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const humanizedChunk = await humanizeText(chunks[i], tone);
+    rendered.push(humanizedChunk.trim());
+  }
+  return { text: rendered.join("\n\n").trim(), chunks: chunks.length };
 }
 
 // ─── Main pipeline ────────────────────────────────────────────────────────────
@@ -491,8 +655,8 @@ A one-paragraph hook or angle that differentiates this article from competitors.
       const densitySection = densityHint
         ? `\n\nPREVIOUS ATTEMPT: primary keyword density was ${densityHint.lastDensity}% (target ${PRIMARY_DENSITY_TARGET_MIN}%–${PRIMARY_DENSITY_TARGET_MAX}%). ${
           densityHint.tooLow
-              ? `That's TOO LOW. Use the primary keyword "${article.primaryKeyword}" more often throughout the body — naturally, in ways that fit the prose. Aim for the keyword to appear roughly every 60-70 words on average.`
-              : `That's TOO HIGH. Use synonyms and pronouns ("the strategy", "this approach", "it") in places where the primary keyword "${article.primaryKeyword}" appears repeatedly close together.`
+              ? `That's TOO LOW. Slightly increase natural mentions of "${article.primaryKeyword}" where they genuinely fit the context. Keep prose varied and avoid repetitive phrasing.`
+              : `That's TOO HIGH. Reduce repeated close-together uses of "${article.primaryKeyword}" by using natural references and varied sentence construction.`
         }\n`
         : "";
 
@@ -503,7 +667,7 @@ ${researchOutput}
 ${sourcesBlock ? `\nVERIFIED SOURCES (the ONLY allowed citation pool):\n${sourcesBlock}\n\nCITATION RULES:\n- You may only cite, quote, or attribute claims to sources from the VERIFIED SOURCES list above.\n- When citing, use one of these forms: a markdown link to the source URL, "according to [Source Name]", or "a [year] [Org] [study/report]". The named org or domain MUST appear in the verified list.\n- Do NOT invent sources. Do NOT cite "industry reports" or "experts say" without a named source from the list.\n- If a claim isn't supported by the verified sources, either don't make it, or state it as your own observation without attribution.\n- Use sources sparingly and where they genuinely add credibility — 2 to 5 citations is typical for an article this length.\n` : ""}
 ARTICLE SPECIFICATIONS:
 - Topic: ${article.topic}
-- Primary keyword: "${article.primaryKeyword}" — STRICT density target: ${PRIMARY_DENSITY_TARGET_MIN}% to ${PRIMARY_DENSITY_TARGET_MAX}% of total word count. For a ${targetWords}-word article, that's roughly ${Math.round(targetWords * PRIMARY_DENSITY_TARGET_MIN / 100)} to ${Math.round(targetWords * PRIMARY_DENSITY_TARGET_MAX / 100)} occurrences. The keyword must be repeated this often, woven into the prose naturally.
+- Primary keyword: "${article.primaryKeyword}" — target density band: ${PRIMARY_DENSITY_TARGET_MIN}% to ${PRIMARY_DENSITY_TARGET_MAX}%. Keep usage natural and contextually relevant; never force repetitive phrasing to hit a numeric target.
 ${article.secondaryKeywords ? `- Secondary keywords: "${article.secondaryKeywords}" — work these in naturally.` : ""}
 ${article.targetAudience ? `- Target audience: ${article.targetAudience}` : ""}
 ${article.tone ? `- Tone: ${article.tone}. Match this tone consistently across the article.` : ""}
@@ -569,11 +733,6 @@ ${article.tone ? `Write in the tone described above.` : "Write in a formal, expe
         break;
       }
     }
-
-    // Word count is tracked but not enforced. Always record as in-band (false)
-    // so the warning banner doesn't fire — actual vs target is still visible
-    // in the UI from wordCountActual + wordCountTarget.
-    const wordCountOutOfBand = false;
 
     // Step 3b: Citation verification — DISABLED.
     // The mechanical citation extraction/verification/strip step is turned off
@@ -686,143 +845,148 @@ ${articleAfterCitationCheck}`;
     let zeroGptScore: number | null = null;
     let humanizationFailed = false;
 
+    let humanizationSucceeded = false;
     if (isZeroGptConfigured()) {
-      // Humanize (3 retries built into humanizeText)
-      await logStep(articleId, "zerogpt_humanize", "running", "Sending article to ZeroGPT humanizer");
-      let humanizationSucceeded = false;
+      await logStep(articleId, "zerogpt_humanize", "running", "Humanizing article with ZeroGPT (chunked mode)");
+      const humanizeStart = Date.now();
+      const inputStats = getTextStats(articleAfterHeadingFix);
       try {
-        const humanized = await humanizeText(articleAfterHeadingFix, article.tone);
-        finalArticle = humanized;
+        const result = await humanizeWithZeroGptChunks(articleAfterHeadingFix, article.tone);
+        finalArticle = result.text;
         humanizationSucceeded = true;
         await logStep(
           articleId,
           "zerogpt_humanize",
           "completed",
-          `Humanization complete (${countWords(humanized)} words)`,
+          `Humanization complete in ${Date.now() - humanizeStart}ms (${inputStats.words} words/${inputStats.chars} chars input, ${result.chunks} chunk(s))`,
         );
       } catch (err) {
-        humanizationFailed = true;
         const errMsg = err instanceof ZeroGptError ? err.message : String(err);
-        logger.warn(
-          { articleId, err },
-          "ZeroGPT humanization failed after retries; publishing un-transformed draft with warning flag",
-        );
+        const errClass = err instanceof ZeroGptError ? err.meta?.category ?? "unknown" : "unknown";
+        const retryable = err instanceof ZeroGptError ? err.meta?.retryable ?? false : false;
+        logger.warn({ articleId, err, errClass, retryable }, "ZeroGPT humanization failed; attempting Claude fallback");
         await logStep(
           articleId,
           "zerogpt_humanize",
           "failed",
-          `Humanization failed after 3 retries: ${errMsg}. Publishing un-transformed draft.`,
+          `ZeroGPT humanization failed (${errClass}, retryable=${retryable}) after ${Date.now() - humanizeStart}ms for ${inputStats.words} words/${inputStats.chars} chars: ${errMsg}. Trying Claude fallback.`,
         );
       }
+    }
 
-      // Step 4b: Format restoration after ZeroGPT.
-      // ZeroGPT's Paraphrase API treats input as one block of text and frequently
-      // mangles markdown structure: collapses paragraph breaks, joins headings
-      // with following text, breaks FAQ Q-numbering, and sometimes inserts
-      // chatbot-style intrusions ("Please provide the text...") directly into
-      // the output. We send the broken result back to Claude with strict
-      // word-preservation instructions to restore structure.
-      //
-      // This step only runs when humanization succeeded — if we're publishing
-      // the un-transformed draft, the original structure is already intact.
-      //
-      // Honest caveat: the model is told not to change words, but LLMs are
-      // imperfect at strict preservation. Spot-check published articles
-      // periodically to catch any cases where wording drifted.
-      if (humanizationSucceeded) {
-        await logStep(articleId, "format_restore", "running", "Restoring markdown structure after humanization");
-        try {
-          const formatFixPrompt = `The text below was just paraphrased by an automated tool, which broke its formatting. Your job is to restore proper markdown formatting WITHOUT CHANGING ANY WORDS.
+    if (!humanizationSucceeded) {
+      await logStep(
+        articleId,
+        "claude_humanize_fallback",
+        "running",
+        "Running Claude humanization fallback",
+      );
+      try {
+        const fallbackStart = Date.now();
+        const fallback = await humanizeWithClaudeFallback(client, articleAfterHeadingFix, article.tone);
+        if (fallback.trim().length > 0) {
+          finalArticle = fallback;
+          humanizationSucceeded = true;
+          await logStep(
+            articleId,
+            "claude_humanize_fallback",
+            "completed",
+            `Claude fallback humanization complete in ${Date.now() - fallbackStart}ms (${countWords(fallback)} words)`,
+          );
+        } else {
+          throw new Error("Claude fallback returned empty output");
+        }
+      } catch (fallbackErr) {
+        humanizationFailed = true;
+        const msg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+        logger.warn({ articleId, err: fallbackErr }, "Claude humanization fallback failed; publishing original draft");
+        await logStep(
+          articleId,
+          "claude_humanize_fallback",
+          "failed",
+          `Claude fallback humanization failed: ${msg}. Publishing un-transformed draft.`,
+        );
+      }
+    }
 
-REFERENCE STRUCTURE (for markdown layout only; do not copy wording from here):
+    // Step 4b: Deterministic format repair first, model restore only when still damaged.
+    if (humanizationSucceeded) {
+      await logStep(articleId, "format_restore", "running", "Running deterministic post-humanization format repair");
+      try {
+        const deterministic = deterministicFormatRepair(finalArticle);
+        finalArticle = deterministic.text;
+        const postDeterministic = assessFormatStructure(articleAfterHeadingFix, finalArticle);
+        if (!postDeterministic.needsModelRestore) {
+          await logStep(
+            articleId,
+            "format_restore",
+            "completed",
+            `Deterministic repair succeeded (intrusions removed ${deterministic.removedIntrusions}, heading coverage ${postDeterministic.candidateHeadingCount}/${postDeterministic.sourceHeadingCount}, FAQs ${postDeterministic.candidateFaqCount}/${postDeterministic.sourceFaqCount}, drift ${(postDeterministic.wordDrift * 100).toFixed(1)}%)`,
+          );
+        } else {
+          const formatFixPrompt = `The text below was paraphrased and still has markdown structure damage. Restore markdown structure while preserving wording as much as possible.
+
+REFERENCE STRUCTURE (layout only):
 <<<REFERENCE_STRUCTURE
 ${articleAfterHeadingFix}
 REFERENCE_STRUCTURE>>>
 
-CRITICAL RULES — read carefully:
-1. Preserve every word exactly as written. Do not add, remove, or substitute any words. Do not "fix" typos. Do not "improve" phrasing. Do not paraphrase anything.
-2. The ONLY changes you may make are:
-   - Adding blank lines between paragraphs
-   - Restoring markdown headings (##, ###) on their own lines with blank lines before and after
-   - Restoring FAQ numbering format (e.g., "**Q1.** What is X?" with proper spacing)
-   - Restoring bullet lists and numbered lists on separate lines
-   - Restoring table structure (| col | col |) with proper line breaks
-   - Removing entire sentences that are clearly chatbot intrusions, such as "Please provide the text you would like me to paraphrase" or "Certainly! Please provide..." or "Here is the rewritten version" — these were not in the original article and should be deleted entirely. ONLY delete sentences that are literally chatbot meta-commentary, never delete actual article content.
-3. Follow the REFERENCE_STRUCTURE only for where headings, paragraphs, lists, tables, and FAQ blocks should break. Keep the paraphrased words from ARTICLE TO RESTORE.
-4. If a heading or FAQ question appears to be missing entirely (the surrounding text suggests there should be a question but no question text exists), do NOT invent one. Leave the gap and let it be flagged later.
-5. Keep the article's H1, H2, H3 hierarchy as it appears in the text. If a heading has been collapsed into a paragraph, restore it to its own line.
-6. Output the cleanly-formatted markdown article. Start with the H1. No preamble, no explanation, no commentary.
+RULES:
+- Preserve words and meaning as much as possible.
+- Restore headings/lists/tables/FAQ numbering to proper markdown lines.
+- Remove only obvious chatbot intrusions (meta lines asking for input).
+- Output markdown only. No commentary.
 
 ARTICLE TO RESTORE:
 ${finalArticle}`;
-
           const restored = await callClaude(client, formatFixPrompt, 8192, {
-            temperature: 0.1, // Very low — we want deterministic, conservative behavior
-            system: `You are a markdown formatter. You restore broken markdown structure without changing any words. Output the article only, no commentary.`,
+            temperature: 0.1,
+            system:
+              "You are a markdown repair assistant. Restore structure with minimal wording drift.",
           });
-
           if (restored.trim().length > 0) {
-            const restoredWords = countWords(restored);
-            const originalWords = countWords(finalArticle);
-            const sourceHeadingCount = (articleAfterHeadingFix.match(/^#{1,3}\s+\S+/gm) ?? []).length;
-            const restoredHeadingCount = (restored.match(/^#{1,3}\s+\S+/gm) ?? []).length;
-            const sourceFaqCount = extractFAQs(articleAfterHeadingFix).length;
-            const restoredFaqCount = extractFAQs(restored).length;
-            const headingCoverageOk =
-              sourceHeadingCount === 0 ||
-              restoredHeadingCount >= Math.max(
-                FORMAT_RESTORE_MIN_HEADING_COUNT,
-                Math.floor(sourceHeadingCount * FORMAT_RESTORE_MIN_HEADING_COVERAGE_RATIO),
-              );
-            const faqCoverageOk = sourceFaqCount === 0 || restoredFaqCount > 0;
-            // Sanity check: if word count differs by more than 5%, the model
-            // changed too much. Reject the restoration and keep the broken
-            // version (better to ship broken format than altered content).
-            const drift = Math.abs(restoredWords - originalWords) / Math.max(originalWords, 1);
-            if (drift > FORMAT_RESTORE_MAX_WORD_DRIFT || !headingCoverageOk || !faqCoverageOk) {
-              await logStep(
-                articleId,
-                "format_restore",
-                "failed",
-                !headingCoverageOk || !faqCoverageOk
-                  ? `Format restoration did not preserve enough structure (headings ${restoredHeadingCount}/${sourceHeadingCount}, FAQs ${restoredFaqCount}/${sourceFaqCount}). Keeping un-restored version.`
-                  : `Format restoration changed word count too much (${originalWords} → ${restoredWords}, ${(drift * 100).toFixed(1)}% drift). Keeping un-restored version.`,
-              );
-            } else {
+            const candidateAssessment = assessFormatStructure(articleAfterHeadingFix, restored);
+            if (!candidateAssessment.needsModelRestore) {
               finalArticle = restored;
               await logStep(
                 articleId,
                 "format_restore",
                 "completed",
-                `Format restored (${originalWords} → ${restoredWords} words, ${(drift * 100).toFixed(1)}% drift — within tolerance)`,
+                `Model-assisted restore accepted (headings ${candidateAssessment.candidateHeadingCount}/${candidateAssessment.sourceHeadingCount}, FAQs ${candidateAssessment.candidateFaqCount}/${candidateAssessment.sourceFaqCount}, drift ${(candidateAssessment.wordDrift * 100).toFixed(1)}%)`,
+              );
+            } else {
+              await logStep(
+                articleId,
+                "format_restore",
+                "failed",
+                `Model-assisted restore rejected (headings ${candidateAssessment.candidateHeadingCount}/${candidateAssessment.sourceHeadingCount}, FAQs ${candidateAssessment.candidateFaqCount}/${candidateAssessment.sourceFaqCount}, drift ${(candidateAssessment.wordDrift * 100).toFixed(1)}%). Keeping deterministic output.`,
               );
             }
           } else {
-            await logStep(articleId, "format_restore", "failed", "Format restoration returned empty content. Keeping un-restored version.");
+            await logStep(articleId, "format_restore", "failed", "Model-assisted format restore returned empty content. Keeping deterministic output.");
           }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.warn({ articleId, err }, "Format restoration errored");
-          await logStep(articleId, "format_restore", "failed", `Format restoration errored: ${msg}. Keeping un-restored version.`);
         }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn({ articleId, err }, "Format restoration errored");
+        await logStep(articleId, "format_restore", "failed", `Format restoration errored: ${msg}. Keeping current version.`);
       }
+    }
 
-      // Step 4c: Optional keyword-density rebalance on the post-humanized
-      // article. Disabled by default because this full-article Claude rewrite
-      // can re-introduce detectable AI patterns right before publish.
-      const finalDensityBeforeRebalance = calculateKeywordDensity(finalArticle, article.primaryKeyword);
-      const densityOutOfBand =
-        finalDensityBeforeRebalance < PRIMARY_DENSITY_TARGET_MIN ||
-        finalDensityBeforeRebalance > PRIMARY_DENSITY_TARGET_MAX;
-      if (densityOutOfBand && ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE) {
-        await logStep(
-          articleId,
-          "density_rebalance",
-          "running",
-          `Final density is ${finalDensityBeforeRebalance}% (target ${PRIMARY_DENSITY_TARGET_MIN}%–${PRIMARY_DENSITY_TARGET_MAX}%). Attempting one controlled rewrite.`,
-        );
-        try {
-          const rebalancePrompt = `Adjust this article so the PRIMARY KEYWORD density lands between ${PRIMARY_DENSITY_TARGET_MIN}% and ${PRIMARY_DENSITY_TARGET_MAX}%.
+    // Step 4c: Optional keyword-density rebalance on the post-humanized article.
+    const finalDensityBeforeRebalance = calculateKeywordDensity(finalArticle, article.primaryKeyword);
+    const densityOutOfBand =
+      finalDensityBeforeRebalance < PRIMARY_DENSITY_TARGET_MIN ||
+      finalDensityBeforeRebalance > PRIMARY_DENSITY_TARGET_MAX;
+    if (densityOutOfBand && ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE) {
+      await logStep(
+        articleId,
+        "density_rebalance",
+        "running",
+        `Final density is ${finalDensityBeforeRebalance}% (target ${PRIMARY_DENSITY_TARGET_MIN}%–${PRIMARY_DENSITY_TARGET_MAX}%). Attempting one controlled rewrite.`,
+      );
+      try {
+        const rebalancePrompt = `Adjust this article so the PRIMARY KEYWORD density lands between ${PRIMARY_DENSITY_TARGET_MIN}% and ${PRIMARY_DENSITY_TARGET_MAX}%.
 
 PRIMARY KEYWORD: "${article.primaryKeyword}"
 CURRENT DENSITY: ${finalDensityBeforeRebalance}%
@@ -836,82 +1000,83 @@ STRICT RULES:
 ARTICLE:
 ${finalArticle}`;
 
-          const rebalanced = await callClaude(client, rebalancePrompt, 8192, {
-            temperature: 0.3,
-            system:
-              "You are an SEO editor making minimal edits to tune primary keyword density while preserving structure and meaning. Output markdown only.",
-          });
+        const rebalanced = await callClaude(client, rebalancePrompt, 8192, {
+          temperature: 0.3,
+          system:
+            "You are an SEO editor making minimal edits to tune primary keyword density while preserving structure and meaning. Output markdown only.",
+        });
 
-          if (rebalanced.trim().length > 0) {
-            const rebalancedDensity = calculateKeywordDensity(rebalanced, article.primaryKeyword);
-            const beforeWords = countWords(finalArticle);
-            const afterWords = countWords(rebalanced);
-            const wordDrift = Math.abs(afterWords - beforeWords) / Math.max(beforeWords, 1);
-            const beforeDistance = densityDistanceFromBand(
-              finalDensityBeforeRebalance,
-              PRIMARY_DENSITY_TARGET_MIN,
-              PRIMARY_DENSITY_TARGET_MAX,
+        if (rebalanced.trim().length > 0) {
+          const rebalancedDensity = calculateKeywordDensity(rebalanced, article.primaryKeyword);
+          const beforeWords = countWords(finalArticle);
+          const afterWords = countWords(rebalanced);
+          const wordDrift = Math.abs(afterWords - beforeWords) / Math.max(beforeWords, 1);
+          const beforeDistance = densityDistanceFromBand(
+            finalDensityBeforeRebalance,
+            PRIMARY_DENSITY_TARGET_MIN,
+            PRIMARY_DENSITY_TARGET_MAX,
+          );
+          const afterDistance = densityDistanceFromBand(
+            rebalancedDensity,
+            PRIMARY_DENSITY_TARGET_MIN,
+            PRIMARY_DENSITY_TARGET_MAX,
+          );
+          const rebalancedInBand =
+            rebalancedDensity >= PRIMARY_DENSITY_TARGET_MIN &&
+            rebalancedDensity <= PRIMARY_DENSITY_TARGET_MAX;
+          const materiallyImproved =
+            beforeDistance - afterDistance >= DENSITY_REBALANCE_MIN_IMPROVEMENT;
+          if (
+            wordDrift <= DENSITY_REBALANCE_MAX_WORD_DRIFT &&
+            (rebalancedInBand || (afterDistance < beforeDistance && materiallyImproved))
+          ) {
+            finalArticle = rebalanced;
+            await logStep(
+              articleId,
+              "density_rebalance",
+              "completed",
+              rebalancedInBand
+                ? `Density rebalanced into target band (${finalDensityBeforeRebalance}% → ${rebalancedDensity}%)`
+                : `Density improved toward target (${finalDensityBeforeRebalance}% → ${rebalancedDensity}%)`,
             );
-            const afterDistance = densityDistanceFromBand(
-              rebalancedDensity,
-              PRIMARY_DENSITY_TARGET_MIN,
-              PRIMARY_DENSITY_TARGET_MAX,
-            );
-            const rebalancedInBand =
-              rebalancedDensity >= PRIMARY_DENSITY_TARGET_MIN &&
-              rebalancedDensity <= PRIMARY_DENSITY_TARGET_MAX;
-            const materiallyImproved =
-              beforeDistance - afterDistance >= DENSITY_REBALANCE_MIN_IMPROVEMENT;
-            if (
-              wordDrift <= DENSITY_REBALANCE_MAX_WORD_DRIFT &&
-              (rebalancedInBand || (afterDistance < beforeDistance && materiallyImproved))
-            ) {
-              finalArticle = rebalanced;
-              await logStep(
-                articleId,
-                "density_rebalance",
-                "completed",
-                rebalancedInBand
-                  ? `Density rebalanced into target band (${finalDensityBeforeRebalance}% → ${rebalancedDensity}%)`
-                  : `Density improved toward target (${finalDensityBeforeRebalance}% → ${rebalancedDensity}%)`,
-              );
-            } else {
-              await logStep(
-                articleId,
-                "density_rebalance",
-                "failed",
-                `Rebalance not accepted (density ${finalDensityBeforeRebalance}% → ${rebalancedDensity}%, word drift ${(wordDrift * 100).toFixed(1)}%). Keeping current version.`,
-              );
-            }
           } else {
             await logStep(
               articleId,
               "density_rebalance",
               "failed",
-              "Density rebalance returned empty content. Keeping current version.",
+              `Rebalance not accepted (density ${finalDensityBeforeRebalance}% → ${rebalancedDensity}%, word drift ${(wordDrift * 100).toFixed(1)}%). Keeping current version.`,
             );
           }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.warn({ articleId, err }, "Density rebalance attempt errored");
+        } else {
           await logStep(
             articleId,
             "density_rebalance",
             "failed",
-            `Density rebalance errored: ${msg}. Keeping current version.`,
+            "Density rebalance returned empty content. Keeping current version.",
           );
         }
-      } else {
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn({ articleId, err }, "Density rebalance attempt errored");
         await logStep(
           articleId,
           "density_rebalance",
-          "completed",
-          densityOutOfBand
-            ? `Skipped post-humanization density rebalance (current ${finalDensityBeforeRebalance}%) to preserve humanized language and reduce AI-detection risk. Set ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE=true to re-enable.`
-            : `Final density already in range (${finalDensityBeforeRebalance}%).`,
+          "failed",
+          `Density rebalance errored: ${msg}. Keeping current version.`,
         );
       }
+    } else {
+      await logStep(
+        articleId,
+        "density_rebalance",
+        "completed",
+        densityOutOfBand
+          ? `Skipped post-humanization density rebalance (current ${finalDensityBeforeRebalance}%) to preserve humanized language and reduce AI-detection risk. Set ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE=true to re-enable.`
+          : `Final density already in range (${finalDensityBeforeRebalance}%).`,
+      );
+    }
 
+    if (isZeroGptConfigured()) {
       // Score the article we're actually going to publish
       await logStep(articleId, "zerogpt_score", "running", "Scoring article with ZeroGPT detector");
       try {
@@ -929,20 +1094,22 @@ ${finalArticle}`;
           articleId,
           "zerogpt_score",
           "failed",
-          `Scoring failed after 3 retries: ${errMsg}. Article will be published without a score.`,
+          `Scoring failed after retries: ${errMsg}. Article will be published without a score.`,
         );
       }
     } else {
-      humanizationFailed = true;
       await logStep(
         articleId,
-        "zerogpt_humanize",
+        "zerogpt_score",
         "failed",
-        "ZEROGPT_API_KEY not configured — article published without humanization or scoring",
+        "ZEROGPT_API_KEY not configured — score skipped",
       );
     }
 
     // Step 5: Safety-net checks (keyword density + FAQ count + FAQ uniqueness + heading keywords)
+    const finalWordCount = countWords(finalArticle);
+    const wordCountOutOfBand =
+      Math.abs(finalWordCount - targetWords) > WORD_COUNT_WARNING_TOLERANCE;
     const primaryDensity = calculateKeywordDensity(finalArticle, article.primaryKeyword);
     const faqCount = extractFAQs(finalArticle).length;
     const faqCountValid = faqCount >= 4 && faqCount <= 8;
@@ -960,6 +1127,11 @@ ${finalArticle}`;
     if (!densityValid) {
       issues.push(
         `primary density ${primaryDensity}% (target ${PRIMARY_DENSITY_TARGET_MIN}-${PRIMARY_DENSITY_TARGET_MAX}%)`,
+      );
+    }
+    if (wordCountOutOfBand) {
+      issues.push(
+        `word count ${finalWordCount} (target ${targetWords} ±${WORD_COUNT_WARNING_TOLERANCE})`,
       );
     }
     if (!faqCountValid) issues.push(`FAQ count ${faqCount} (allowed: 4-8)`);
@@ -1064,7 +1236,7 @@ Respond with a single JSON object and nothing else.`;
     await updateArticleStatus(articleId, "completed", {
       title: seoData.title || article.topic,
       articleContent: finalArticle,
-      wordCountActual: countWords(finalArticle),
+      wordCountActual: finalWordCount,
       primaryKeywordDensity: primaryDensity,
       secondaryKeywordDensity: article.secondaryKeywords
         ? calculateKeywordDensity(finalArticle, article.secondaryKeywords.split(",")[0].trim())
