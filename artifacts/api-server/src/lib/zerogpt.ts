@@ -27,6 +27,12 @@ import { logger } from "./logger";
  *                                           user's free-text tone doesn't map to
  *                                           a ZeroGPT preset. Defaults to "Standard".
  *   ZEROGPT_GEN_SPEED          (optional) - "quick" (default) or "thinking" (VIP only)
+ *   ZEROGPT_PARAPHRASE_TIMEOUT_MS (optional) - base timeout for paraphrase requests
+ *                                              in ms. Defaults to 90000.
+ *   ZEROGPT_PARAPHRASE_TIMEOUT_PER_WORD_MS (optional) - extra timeout budget per
+ *                                              input word. Defaults to 40.
+ *   ZEROGPT_PARAPHRASE_TIMEOUT_CAP_MS (optional) - max paraphrase timeout in ms.
+ *                                              Defaults to 300000.
  */
 
 const ZEROGPT_API_KEY = process.env.ZEROGPT_API_KEY;
@@ -34,11 +40,13 @@ const ZEROGPT_API_BASE_URL = process.env.ZEROGPT_API_BASE_URL ?? "https://api.ze
 const ZEROGPT_PARAPHRASE_PATH = process.env.ZEROGPT_PARAPHRASE_PATH ?? "/api/transform/paraphrase";
 const ZEROGPT_DETECT_PATH = process.env.ZEROGPT_DETECT_PATH ?? "/api/detect/detectText";
 const ZEROGPT_DEFAULT_TONE = process.env.ZEROGPT_DEFAULT_TONE ?? "Standard";
-const ZEROGPT_GEN_SPEED = process.env.ZEROGPT_GEN_SPEED ?? "quick";
+const ZEROGPT_GEN_SPEED_RAW = process.env.ZEROGPT_GEN_SPEED ?? "quick";
 
 const PARAPHRASE_MAX_ATTEMPTS = 3;
 const PARAPHRASE_BASE_DELAY_MS = 2000;
-const PARAPHRASE_TIMEOUT_MS = 90_000;
+const PARAPHRASE_BASE_TIMEOUT_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_MS", 90_000);
+const PARAPHRASE_TIMEOUT_PER_WORD_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_PER_WORD_MS", 40);
+const PARAPHRASE_TIMEOUT_CAP_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_CAP_MS", 300_000);
 const DETECT_MAX_ATTEMPTS = 2;
 const DETECT_BASE_DELAY_MS = 1000;
 const DETECT_TIMEOUT_MS = 25_000;
@@ -59,6 +67,7 @@ const VALID_ZEROGPT_TONES = new Set([
   "Lawyer",
   "Teenager",
 ]);
+const VALID_GEN_SPEEDS = new Set(["quick", "thinking"]);
 
 export class ZeroGptError extends Error {
   constructor(message: string, public readonly cause?: unknown) {
@@ -69,6 +78,38 @@ export class ZeroGptError extends Error {
 
 export function isZeroGptConfigured(): boolean {
   return Boolean(ZEROGPT_API_KEY);
+}
+
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    logger.warn({ name, raw, fallback }, "Invalid positive integer env value; using fallback");
+    return fallback;
+  }
+  return value;
+}
+
+function normalizeGenSpeed(): "quick" | "thinking" {
+  const speed = ZEROGPT_GEN_SPEED_RAW.trim().toLowerCase();
+  if (VALID_GEN_SPEEDS.has(speed)) return speed as "quick" | "thinking";
+  logger.warn(
+    { speed: ZEROGPT_GEN_SPEED_RAW },
+    "Invalid ZEROGPT_GEN_SPEED; falling back to quick",
+  );
+  return "quick";
+}
+
+function getParaphraseTimeoutMs(text: string): number {
+  const wordCount = text.trim().length === 0 ? 0 : text.trim().split(/\s+/).length;
+  const adaptive = PARAPHRASE_BASE_TIMEOUT_MS + wordCount * PARAPHRASE_TIMEOUT_PER_WORD_MS;
+  return Math.min(adaptive, PARAPHRASE_TIMEOUT_CAP_MS);
+}
+
+function toErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
 }
 
 async function fetchWithTimeout(
@@ -153,6 +194,8 @@ export async function humanizeText(
     logger.warn({ tone }, "Mapped tone is not a valid ZeroGPT preset; using Standard");
   }
   const safeTone = VALID_ZEROGPT_TONES.has(tone) ? tone : "Standard";
+  const safeGenSpeed = normalizeGenSpeed();
+  const paraphraseTimeoutMs = getParaphraseTimeoutMs(text);
 
   const url = `${ZEROGPT_API_BASE_URL}${ZEROGPT_PARAPHRASE_PATH}`;
   let lastErr: unknown;
@@ -171,10 +214,10 @@ export async function humanizeText(
             string: text,
             tone: safeTone,
             skipRealtime: 1,           // do NOT use websocket (we're synchronous)
-            gen_speed: ZEROGPT_GEN_SPEED,
+            gen_speed: safeGenSpeed,
           }),
         },
-        PARAPHRASE_TIMEOUT_MS,
+        paraphraseTimeoutMs,
       );
 
       if (!response.ok) {
@@ -209,15 +252,16 @@ export async function humanizeText(
       if (isLastAttempt) break;
       const delay = PARAPHRASE_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
-        { err, attempt, delay, tone: safeTone },
+        { err, attempt, delay, tone: safeTone, genSpeed: safeGenSpeed, timeoutMs: paraphraseTimeoutMs },
         `ZeroGPT paraphrase attempt ${attempt} failed; retrying in ${delay}ms`,
       );
       await new Promise((r) => setTimeout(r, delay));
     }
   }
 
+  const detail = toErrorMessage(lastErr);
   throw new ZeroGptError(
-    `ZeroGPT paraphrase failed after ${PARAPHRASE_MAX_ATTEMPTS} attempts`,
+    `ZeroGPT paraphrase failed after ${PARAPHRASE_MAX_ATTEMPTS} attempts (last error: ${detail})`,
     lastErr,
   );
 }
