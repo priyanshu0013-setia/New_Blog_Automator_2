@@ -563,10 +563,7 @@ ${article.tone ? `Write in the tone described above.` : "Write in a formal, expe
         PRIMARY_DENSITY_TARGET_MIN,
         PRIMARY_DENSITY_TARGET_MAX,
       );
-      if (
-        densityDistance <= DRAFT_DENSITY_RETRY_MAX_DISTANCE ||
-        densityAttempt >= MAX_DENSITY_ATTEMPTS
-      ) {
+      if (densityDistance <= DRAFT_DENSITY_RETRY_MAX_DISTANCE) {
         break;
       }
     }
