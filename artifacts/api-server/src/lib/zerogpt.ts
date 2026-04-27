@@ -36,8 +36,12 @@ const ZEROGPT_DETECT_PATH = process.env.ZEROGPT_DETECT_PATH ?? "/api/detect/dete
 const ZEROGPT_DEFAULT_TONE = process.env.ZEROGPT_DEFAULT_TONE ?? "Standard";
 const ZEROGPT_GEN_SPEED = process.env.ZEROGPT_GEN_SPEED ?? "quick";
 
-const MAX_ATTEMPTS = 3;
-const BASE_DELAY_MS = 2000;
+const PARAPHRASE_MAX_ATTEMPTS = 3;
+const PARAPHRASE_BASE_DELAY_MS = 2000;
+const PARAPHRASE_TIMEOUT_MS = 90_000;
+const DETECT_MAX_ATTEMPTS = 2;
+const DETECT_BASE_DELAY_MS = 1000;
+const DETECT_TIMEOUT_MS = 25_000;
 
 /**
  * Valid tone values accepted by ZeroGPT's paraphraser, per their docs.
@@ -65,6 +69,25 @@ export class ZeroGptError extends Error {
 
 export function isZeroGptConfigured(): boolean {
   return Boolean(ZEROGPT_API_KEY);
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new ZeroGptError(`ZeroGPT request timed out after ${timeoutMs}ms`, err);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -134,21 +157,25 @@ export async function humanizeText(
   const url = `${ZEROGPT_API_BASE_URL}${ZEROGPT_PARAPHRASE_PATH}`;
   let lastErr: unknown;
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= PARAPHRASE_MAX_ATTEMPTS; attempt++) {
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ApiKey: ZEROGPT_API_KEY,
+      const response = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ApiKey: ZEROGPT_API_KEY,
+          },
+          body: JSON.stringify({
+            string: text,
+            tone: safeTone,
+            skipRealtime: 1,           // do NOT use websocket (we're synchronous)
+            gen_speed: ZEROGPT_GEN_SPEED,
+          }),
         },
-        body: JSON.stringify({
-          string: text,
-          tone: safeTone,
-          skipRealtime: 1,           // do NOT use websocket (we're synchronous)
-          gen_speed: ZEROGPT_GEN_SPEED,
-        }),
-      });
+        PARAPHRASE_TIMEOUT_MS,
+      );
 
       if (!response.ok) {
         const body = await response.text().catch(() => "<unreadable>");
@@ -178,9 +205,9 @@ export async function humanizeText(
       return paraphrased;
     } catch (err) {
       lastErr = err;
-      const isLastAttempt = attempt === MAX_ATTEMPTS;
+      const isLastAttempt = attempt === PARAPHRASE_MAX_ATTEMPTS;
       if (isLastAttempt) break;
-      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      const delay = PARAPHRASE_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
         { err, attempt, delay, tone: safeTone },
         `ZeroGPT paraphrase attempt ${attempt} failed; retrying in ${delay}ms`,
@@ -190,7 +217,7 @@ export async function humanizeText(
   }
 
   throw new ZeroGptError(
-    `ZeroGPT paraphrase failed after ${MAX_ATTEMPTS} attempts`,
+    `ZeroGPT paraphrase failed after ${PARAPHRASE_MAX_ATTEMPTS} attempts`,
     lastErr,
   );
 }
@@ -207,16 +234,20 @@ export async function scoreAiContent(text: string): Promise<number> {
   const url = `${ZEROGPT_API_BASE_URL}${ZEROGPT_DETECT_PATH}`;
   let lastErr: unknown;
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= DETECT_MAX_ATTEMPTS; attempt++) {
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ApiKey: ZEROGPT_API_KEY,
+      const response = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ApiKey: ZEROGPT_API_KEY,
+          },
+          body: JSON.stringify({ input_text: text }),
         },
-        body: JSON.stringify({ input_text: text }),
-      });
+        DETECT_TIMEOUT_MS,
+      );
 
       if (!response.ok) {
         const body = await response.text().catch(() => "<unreadable>");
@@ -242,9 +273,9 @@ export async function scoreAiContent(text: string): Promise<number> {
       return score;
     } catch (err) {
       lastErr = err;
-      const isLastAttempt = attempt === MAX_ATTEMPTS;
+      const isLastAttempt = attempt === DETECT_MAX_ATTEMPTS;
       if (isLastAttempt) break;
-      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      const delay = DETECT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       logger.warn(
         { err, attempt, delay },
         `ZeroGPT detect attempt ${attempt} failed; retrying in ${delay}ms`,
@@ -254,7 +285,7 @@ export async function scoreAiContent(text: string): Promise<number> {
   }
 
   throw new ZeroGptError(
-    `ZeroGPT detect failed after ${MAX_ATTEMPTS} attempts`,
+    `ZeroGPT detect failed after ${DETECT_MAX_ATTEMPTS} attempts`,
     lastErr,
   );
 }

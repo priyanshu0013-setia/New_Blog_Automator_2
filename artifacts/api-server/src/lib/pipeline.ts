@@ -36,6 +36,7 @@ const FORMAT_RESTORE_MIN_HEADING_COVERAGE_RATIO = 0.6;
 const FORMAT_RESTORE_MAX_WORD_DRIFT = 0.05;
 const DENSITY_REBALANCE_MAX_WORD_DRIFT = 0.08;
 const DENSITY_REBALANCE_MIN_IMPROVEMENT = 0.25;
+const DRAFT_DENSITY_RETRY_MAX_DISTANCE = 0.2;
 
 // ─── DB helpers ──────────────────────────────────────────────────────────────
 
@@ -482,7 +483,7 @@ A one-paragraph hook or angle that differentiates this article from competitors.
     await updateArticleStatus(articleId, "writing");
 
     const targetWords = article.wordCountTarget;
-    const MAX_DENSITY_ATTEMPTS = 3; // 1 initial + 2 retries
+    const MAX_DENSITY_ATTEMPTS = 2; // 1 initial + 1 retry
 
     const buildWritingPrompt = (densityHint?: { lastDensity: number; tooLow: boolean }) => {
       const densitySection = densityHint
@@ -555,6 +556,18 @@ ${article.tone ? `Write in the tone described above.` : "Write in a formal, expe
 
       if (draftDensity >= PRIMARY_DENSITY_TARGET_MIN && draftDensity <= PRIMARY_DENSITY_TARGET_MAX) {
         break; // density in band, accept
+      }
+
+      const densityDistance = densityDistanceFromBand(
+        draftDensity,
+        PRIMARY_DENSITY_TARGET_MIN,
+        PRIMARY_DENSITY_TARGET_MAX,
+      );
+      if (
+        densityDistance <= DRAFT_DENSITY_RETRY_MAX_DISTANCE ||
+        densityAttempt >= MAX_DENSITY_ATTEMPTS
+      ) {
+        break;
       }
     }
 
