@@ -31,6 +31,11 @@ type ArticleStatus =
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PRIMARY_DENSITY_TARGET_MIN = 1.0;
 const PRIMARY_DENSITY_TARGET_MAX = 2.5;
+const FORMAT_RESTORE_MIN_HEADING_COUNT = 3;
+const FORMAT_RESTORE_MIN_HEADING_COVERAGE_RATIO = 0.6;
+const FORMAT_RESTORE_MAX_WORD_DRIFT = 0.05;
+const DENSITY_REBALANCE_MAX_WORD_DRIFT = 0.08;
+const DENSITY_REBALANCE_MIN_IMPROVEMENT = 0.25;
 
 // ─── DB helpers ──────────────────────────────────────────────────────────────
 
@@ -77,7 +82,7 @@ function calculateKeywordDensity(text: string, keyword: string): number {
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`[^`]*`/g, " ")
     .replace(/\[[^\]]+\]\([^)]+\)/g, " ")
-    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/https?:\/\/[^\s)\]}>,]+/g, " ")
     .replace(/[#>*_|~]/g, " ")
     .replace(/[^a-z0-9\s-]/g, " ")
     .replace(/\s+/g, " ")
@@ -753,13 +758,16 @@ ${finalArticle}`;
             const restoredFaqCount = extractFAQs(restored).length;
             const headingCoverageOk =
               sourceHeadingCount === 0 ||
-              restoredHeadingCount >= Math.max(3, Math.floor(sourceHeadingCount * 0.6));
+              restoredHeadingCount >= Math.max(
+                FORMAT_RESTORE_MIN_HEADING_COUNT,
+                Math.floor(sourceHeadingCount * FORMAT_RESTORE_MIN_HEADING_COVERAGE_RATIO),
+              );
             const faqCoverageOk = sourceFaqCount === 0 || restoredFaqCount > 0;
             // Sanity check: if word count differs by more than 5%, the model
             // changed too much. Reject the restoration and keep the broken
             // version (better to ship broken format than altered content).
             const drift = Math.abs(restoredWords - originalWords) / Math.max(originalWords, 1);
-            if (drift > 0.05 || !headingCoverageOk || !faqCoverageOk) {
+            if (drift > FORMAT_RESTORE_MAX_WORD_DRIFT || !headingCoverageOk || !faqCoverageOk) {
               await logStep(
                 articleId,
                 "format_restore",
@@ -836,13 +844,23 @@ ${finalArticle}`;
               PRIMARY_DENSITY_TARGET_MIN,
               PRIMARY_DENSITY_TARGET_MAX,
             );
-            if (afterDistance < beforeDistance && wordDrift <= 0.08) {
+            const rebalancedInBand =
+              rebalancedDensity >= PRIMARY_DENSITY_TARGET_MIN &&
+              rebalancedDensity <= PRIMARY_DENSITY_TARGET_MAX;
+            const materiallyImproved =
+              beforeDistance - afterDistance >= DENSITY_REBALANCE_MIN_IMPROVEMENT;
+            if (
+              wordDrift <= DENSITY_REBALANCE_MAX_WORD_DRIFT &&
+              (rebalancedInBand || (afterDistance < beforeDistance && materiallyImproved))
+            ) {
               finalArticle = rebalanced;
               await logStep(
                 articleId,
                 "density_rebalance",
                 "completed",
-                `Density improved ${finalDensityBeforeRebalance}% → ${rebalancedDensity}%`,
+                rebalancedInBand
+                  ? `Density rebalanced into target band (${finalDensityBeforeRebalance}% → ${rebalancedDensity}%)`
+                  : `Density improved toward target (${finalDensityBeforeRebalance}% → ${rebalancedDensity}%)`,
               );
             } else {
               await logStep(
