@@ -1,0 +1,454 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Blog Automation API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: articles
+    description: Article pipeline operations
+  - name: pipeline-logs
+    description: Pipeline log operations
+  - name: stats
+    description: Dashboard statistics
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /articles:
+    get:
+      operationId: listArticles
+      tags: [articles]
+      summary: List all articles
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of articles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Article"
+    post:
+      operationId: createArticle
+      tags: [articles]
+      summary: Create a new article and start pipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateArticleBody"
+      responses:
+        "201":
+          description: Article created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Article"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /articles/batch:
+    post:
+      operationId: createArticlesBatch
+      tags: [articles]
+      summary: Create multiple articles from CSV/XLSX batch upload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchCreateBody"
+      responses:
+        "201":
+          description: Articles created
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Article"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /articles/{id}:
+    get:
+      operationId: getArticle
+      tags: [articles]
+      summary: Get article by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Article found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Article"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: deleteArticle
+      tags: [articles]
+      summary: Delete article
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /articles/{id}/retry:
+    post:
+      operationId: retryArticle
+      tags: [articles]
+      summary: Retry a failed article
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Article retried
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Article"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /articles/{id}/regenerate:
+    post:
+      operationId: regenerateArticle
+      tags: [articles]
+      summary: Regenerate an article with the same inputs (creates a new article record)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: New article queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Article"
+        "404":
+          description: Source article not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /articles/{id}/logs:
+    get:
+      operationId: getArticleLogs
+      tags: [pipeline-logs]
+      summary: Get pipeline logs for an article
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Pipeline logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PipelineLog"
+
+  /stats/dashboard:
+    get:
+      operationId: getDashboardStats
+      tags: [stats]
+      summary: Get dashboard summary statistics
+      responses:
+        "200":
+          description: Dashboard statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardStats"
+
+  /stats/active:
+    get:
+      operationId: getActiveArticles
+      tags: [stats]
+      summary: Get articles currently in pipeline
+      responses:
+        "200":
+          description: Active articles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Article"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    Article:
+      type: object
+      properties:
+        id:
+          type: integer
+        title:
+          type: ["string", "null"]
+        topic:
+          type: string
+        primaryKeyword:
+          type: string
+        secondaryKeywords:
+          type: ["string", "null"]
+        targetAudience:
+          type: ["string", "null"]
+        tone:
+          type: ["string", "null"]
+        referenceInput:
+          type: ["string", "null"]
+        wordCountTarget:
+          type: integer
+        wordCountActual:
+          type: ["integer", "null"]
+        wordCountOutOfBand:
+          type: boolean
+        verifiedSources:
+          type: ["array", "null"]
+          items:
+            type: object
+            properties:
+              url: { type: string }
+              title: { type: string }
+              snippet: { type: string }
+              publishedDate: { type: string }
+              domain: { type: string }
+        citationCount:
+          type: integer
+        unverifiedCitationsRemoved:
+          type: integer
+        status:
+          type: string
+          enum: [queued, researching, writing, humanizing, checking, retrying, formatting, completed, failed, flagged]
+        zeroGptScore:
+          type: ["number", "null"]
+        humanizationFailed:
+          type: boolean
+        copyleaksScore:
+          type: ["number", "null"]
+        burstinessScore:
+          type: ["number", "null"]
+        lexicalFingerprintScore:
+          type: ["number", "null"]
+        primaryKeywordDensity:
+          type: ["number", "null"]
+        secondaryKeywordDensity:
+          type: ["number", "null"]
+        emDashCount:
+          type: ["integer", "null"]
+        faqCount:
+          type: ["integer", "null"]
+        googleDocUrl:
+          type: ["string", "null"]
+        googleDocFileName:
+          type: ["string", "null"]
+        seoMetaDescription:
+          type: ["string", "null"]
+        seoSlug:
+          type: ["string", "null"]
+        seoTags:
+          type: ["string", "null"]
+        retryCount:
+          type: integer
+        aiSignatureRetryCount:
+          type: integer
+        createdBy:
+          type: ["string", "null"]
+        errorMessage:
+          type: ["string", "null"]
+        articleContent:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: ["string", "null"]
+          format: date-time
+      required:
+        - id
+        - topic
+        - primaryKeyword
+        - wordCountTarget
+        - status
+        - retryCount
+        - aiSignatureRetryCount
+        - createdAt
+
+    CreateArticleBody:
+      type: object
+      properties:
+        topic:
+          type: string
+        primaryKeyword:
+          type: string
+        secondaryKeywords:
+          type: string
+        targetAudience:
+          type: string
+        tone:
+          type: string
+        referenceInput:
+          type: string
+        wordCountTarget:
+          type: integer
+        createdBy:
+          type: string
+      required:
+        - topic
+        - primaryKeyword
+        - wordCountTarget
+
+    BatchCreateBody:
+      type: object
+      properties:
+        articles:
+          type: array
+          items:
+            $ref: "#/components/schemas/CreateArticleBody"
+      required:
+        - articles
+
+    PipelineLog:
+      type: object
+      properties:
+        id:
+          type: integer
+        articleId:
+          type: integer
+        stepName:
+          type: string
+        status:
+          type: string
+          enum: [running, completed, failed]
+        details:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - articleId
+        - stepName
+        - status
+        - createdAt
+
+    DashboardStats:
+      type: object
+      properties:
+        totalArticles:
+          type: integer
+        completedArticles:
+          type: integer
+        failedArticles:
+          type: integer
+        activeArticles:
+          type: integer
+        avgZeroGptScore:
+          type: ["number", "null"]
+        avgPrimaryDensity:
+          type: ["number", "null"]
+        successRate:
+          type: ["number", "null"]
+        articlesThisWeek:
+          type: integer
+      required:
+        - totalArticles
+        - completedArticles
+        - failedArticles
+        - activeArticles
+        - articlesThisWeek

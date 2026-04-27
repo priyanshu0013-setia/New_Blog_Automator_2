@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "hIcWLO5mhFNfkbo2M1iSn"
+uri = "file://blogautomator.tar.gz"
+type = "unspecified"
+title = "BlogAutomator — Complete Project (GitHub-ready)"
