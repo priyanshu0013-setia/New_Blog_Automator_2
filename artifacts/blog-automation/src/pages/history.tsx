@@ -49,7 +49,7 @@ export default function History() {
         // Roll back every snapshot we took. Cast through unknown because the
         // generated mutation type defaults TContext to unknown, and we can't
         // override that generic without also providing the TError generic.
-        const ctx = context as { previous?: Array<[unknown, Article[] | undefined]> } | undefined;
+        const ctx = context as { previous?: Array<[readonly unknown[], Article[] | undefined]> } | undefined;
         if (ctx?.previous) {
           for (const [key, value] of ctx.previous) {
             qc.setQueryData(key, value);

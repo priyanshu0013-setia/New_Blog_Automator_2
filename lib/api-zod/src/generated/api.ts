@@ -104,6 +104,7 @@ export const CreateArticlesBatchBody = zod.object({
       primaryKeyword: zod.string(),
       secondaryKeywords: zod.string().optional(),
       targetAudience: zod.string().optional(),
+      tone: zod.string().optional(),
       referenceInput: zod.string().optional(),
       wordCountTarget: zod.number(),
       createdBy: zod.string().optional(),

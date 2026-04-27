@@ -11,6 +11,7 @@ export interface CreateArticleBody {
   primaryKeyword: string;
   secondaryKeywords?: string;
   targetAudience?: string;
+  tone?: string;
   referenceInput?: string;
   wordCountTarget: number;
   createdBy?: string;

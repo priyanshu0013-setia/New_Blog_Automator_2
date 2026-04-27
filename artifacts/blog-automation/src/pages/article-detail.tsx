@@ -53,7 +53,7 @@ export default function ArticleDetail() {
         return { previous };
       },
       onError: (_err, _vars, context) => {
-        const ctx = context as { previous?: Array<[unknown, Article[] | undefined]> } | undefined;
+        const ctx = context as { previous?: Array<[readonly unknown[], Article[] | undefined]> } | undefined;
         if (ctx?.previous) {
           for (const [key, value] of ctx.previous) {
             qc.setQueryData(key, value);
