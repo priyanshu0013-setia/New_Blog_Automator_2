@@ -34,6 +34,8 @@ const PRIMARY_DENSITY_TARGET_MAX = 2.5;
 const FORMAT_RESTORE_MIN_HEADING_COUNT = 3;
 const FORMAT_RESTORE_MIN_HEADING_COVERAGE_RATIO = 0.6;
 const FORMAT_RESTORE_MAX_WORD_DRIFT = 0.05;
+const ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE =
+  process.env.ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE === "true";
 const DENSITY_REBALANCE_MAX_WORD_DRIFT = 0.08;
 const DENSITY_REBALANCE_MIN_IMPROVEMENT = 0.25;
 const DRAFT_DENSITY_RETRY_MAX_DISTANCE = 0.2;
@@ -805,13 +807,14 @@ ${finalArticle}`;
         }
       }
 
-      // Step 4c: Rebalance primary keyword density on the final post-humanized
-      // article. ZeroGPT paraphrasing often reduces exact keyword frequency.
+      // Step 4c: Optional keyword-density rebalance on the post-humanized
+      // article. Disabled by default because this full-article Claude rewrite
+      // can re-introduce detectable AI patterns right before publish.
       const finalDensityBeforeRebalance = calculateKeywordDensity(finalArticle, article.primaryKeyword);
       const densityOutOfBand =
         finalDensityBeforeRebalance < PRIMARY_DENSITY_TARGET_MIN ||
         finalDensityBeforeRebalance > PRIMARY_DENSITY_TARGET_MAX;
-      if (densityOutOfBand) {
+      if (densityOutOfBand && ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE) {
         await logStep(
           articleId,
           "density_rebalance",
@@ -903,7 +906,9 @@ ${finalArticle}`;
           articleId,
           "density_rebalance",
           "completed",
-          `Final density already in range (${finalDensityBeforeRebalance}%).`,
+          densityOutOfBand
+            ? `Skipped post-humanization density rebalance (current ${finalDensityBeforeRebalance}%) to preserve humanized language and reduce AI-detection risk. Set ENABLE_POST_HUMANIZATION_DENSITY_REBALANCE=true to re-enable.`
+            : `Final density already in range (${finalDensityBeforeRebalance}%).`,
         );
       }
 
