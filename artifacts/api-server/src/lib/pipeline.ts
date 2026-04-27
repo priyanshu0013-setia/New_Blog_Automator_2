@@ -10,7 +10,7 @@ import {
   isZeroGptConfigured,
   ZeroGptError,
   getTextStats,
-  isParaphraserMetaText,
+  stripIntrusionLines,
 } from "./zerogpt";
 import {
   gatherVerifiedSources,
@@ -408,11 +408,7 @@ function splitArticleForHumanization(article: string): string[] {
 }
 
 function stripChatbotIntrusions(text: string): { text: string; removedCount: number } {
-  const lines = text.split("\n");
-  const filtered = lines.filter((line) => {
-    return !isParaphraserMetaText(line);
-  });
-  return { text: filtered.join("\n"), removedCount: lines.length - filtered.length };
+  return stripIntrusionLines(text);
 }
 
 function deterministicFormatRepair(text: string): { text: string; changed: boolean; removedIntrusions: number } {

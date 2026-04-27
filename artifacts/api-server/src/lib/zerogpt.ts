@@ -49,6 +49,9 @@ const PARAPHRASE_TIMEOUT_PER_WORD_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_T
 const PARAPHRASE_TIMEOUT_CAP_MS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_TIMEOUT_CAP_MS", 300_000);
 const PARAPHRASE_MAX_WORDS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_MAX_WORDS", 3500);
 const PARAPHRASE_MAX_CHARS = parsePositiveIntEnv("ZEROGPT_PARAPHRASE_MAX_CHARS", 30000);
+// Minimum fraction of the original word count that must survive intrusion
+// stripping for us to accept the cleaned result rather than rejecting the chunk.
+const PARAPHRASE_MIN_RETENTION_RATIO = 0.5;
 const DETECT_MAX_ATTEMPTS = 2;
 const DETECT_BASE_DELAY_MS = 1000;
 const DETECT_TIMEOUT_MS = 25_000;
@@ -207,6 +210,17 @@ export function isParaphraserMetaText(text: string): boolean {
   const normalized = text.trim();
   if (!normalized) return false;
   return PARAPHRASER_INTRUSION_REGEX.test(normalized);
+}
+
+/**
+ * Strip lines containing chatbot/paraphraser meta-text from a block of text.
+ * Operates line-by-line so only the offending lines are removed, leaving the
+ * rest of the content intact.
+ */
+export function stripIntrusionLines(text: string): { text: string; removedCount: number } {
+  const lines = text.split("\n");
+  const kept = lines.filter((line) => !isParaphraserMetaText(line));
+  return { text: kept.join("\n"), removedCount: lines.length - kept.length };
 }
 
 async function fetchWithTimeout(
@@ -381,8 +395,23 @@ export async function humanizeText(
       }
       const intrusion = detectParaphraserIntrusion(paraphrased);
       if (intrusion) {
+        // Try line-level stripping before rejecting the whole chunk. If the
+        // intrusion is limited to a few lines (e.g. "Here's the rewritten
+        // version:") we can salvage the rest of the output rather than
+        // discarding everything and falling back to Claude.
+        const stripped = stripIntrusionLines(paraphrased);
+        const strippedWords = getTextStats(stripped.text).words;
+        const originalWords = getTextStats(paraphrased).words;
+        const retentionRatio = originalWords > 0 ? strippedWords / originalWords : 0;
+        if (stripped.text.trim().length > 0 && retentionRatio >= PARAPHRASE_MIN_RETENTION_RATIO) {
+          logger.warn(
+            { intrusion, removedLines: stripped.removedCount, retentionRatio: retentionRatio.toFixed(2), attempt },
+            "ZeroGPT paraphrase contained intrusion lines; stripped and keeping remaining content",
+          );
+          return stripped.text.trim();
+        }
         throw createZeroGptError(
-          `ZeroGPT paraphrase output contained meta-chat intrusion (${intrusion})`,
+          `ZeroGPT paraphrase output contained meta-chat intrusion (${intrusion}); stripped result too short (${strippedWords} of ${originalWords} words retained)`,
           {
             category: "response_invalid",
             retryable: false,
