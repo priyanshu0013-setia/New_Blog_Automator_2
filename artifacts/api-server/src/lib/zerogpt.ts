@@ -102,13 +102,14 @@ function normalizeGenSpeed(): "quick" | "thinking" {
 }
 
 function getParaphraseTimeoutMs(text: string): number {
-  const wordCount = text.trim().length === 0 ? 0 : text.trim().split(/\s+/).length;
+  const trimmed = text.trim();
+  const wordCount = trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length;
   const adaptive = PARAPHRASE_BASE_TIMEOUT_MS + wordCount * PARAPHRASE_TIMEOUT_PER_WORD_MS;
   return Math.min(adaptive, PARAPHRASE_TIMEOUT_CAP_MS);
 }
 
 function toErrorMessage(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
+  if (err instanceof Error) return err.message;
   return String(err);
 }
 
